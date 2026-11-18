@@ -1,146 +1,124 @@
-<!-- 若後端有傳入 modal 參數，透過 hx-swap-oob 自動注入全域 Modal 容器並彈出視窗 -->
-{% if modal %}
-<div id="global-modal-container" hx-swap-oob="innerHTML">
-    {% include 'books/partials/modal_alert.html' with modal_title=modal.title modal_type=modal.type modal_icon=modal.icon modal_message=modal.message %}
+<!-- 個人借閱與預約儀表板 -->
+<div class="row g-3 mb-4">
+    <div class="col-md-6">
+        <div class="card border-0 shadow-sm h-100">
+            <div class="card-header bg-white fw-bold">
+                <i class="fa-solid fa-book-bookmark text-info me-2"></i>我的借閱中書籍 ({{ active_loans|length }}/5)
+            </div>
+            <ul class="list-group list-group-flush">
+                {% for loan in active_loans %}
+                <li class="list-group-item d-flex justify-content-between align-items-center">
+                    <div>
+                        <strong>{{ loan.copy.book.title }}</strong>
+                        <span class="badge bg-secondary barcode-badge ms-1">{{ loan.copy.barcode }}</span>
+                        <div class="small text-muted">應還日期：{{ loan.due_date|date:"Y-m-d" }}</div>
+                    </div>
+                    <button hx-post="{% url 'books:return_copy' %}"
+                            hx-vals='{"barcode": "{{ loan.copy.barcode }}"}'
+                            hx-target="#workspace-container"
+                            class="btn btn-sm btn-outline-success">快速歸還</button>
+                </li>
+                {% empty %}
+                <li class="list-group-item text-muted small">目前無借閱中書籍</li>
+                {% endfor %}
+            </ul>
+        </div>
+    </div>
+    <div class="col-md-6">
+        <div class="card border-0 shadow-sm h-100">
+            <div class="card-header bg-white fw-bold">
+                <i class="fa-solid fa-clock-rotate-left text-warning me-2"></i>我的預約與候補清單 ({{ user_reservations|length }}/3)
+            </div>
+            <ul class="list-group list-group-flush">
+                {% for res in user_reservations %}
+                <li class="list-group-item d-flex justify-content-between align-items-center">
+                    <div>
+                        <strong>{{ res.book.title }}</strong>
+                        {% if res.status == "READY" %}
+                        <span class="badge bg-success ms-1">已到館待取 ({{ res.assigned_copy.barcode }})</span>
+                        <div class="small text-danger">取書期限：{{ res.pickup_deadline|date:"Y-m-d H:i" }}</div>
+                        {% else %}
+                        <span class="badge bg-warning text-dark ms-1">排隊候補中</span>
+                        {% endif %}
+                    </div>
+                </li>
+                {% empty %}
+                <li class="list-group-item text-muted small">目前無預約紀錄</li>
+                {% endfor %}
+            </ul>
+        </div>
+    </div>
 </div>
-{% endif %}
 
-<div class="card shadow-sm border-0 mb-4">
-    <div class="card-header bg-white fw-bold d-flex justify-content-between align-items-center">
-        <span><i class="fa-solid fa-books text-indigo me-2"></i>館藏書目清單</span>
-        <span class="badge bg-secondary">共 {{ books|length }} 冊</span>
+<!-- 全館書目與實體副本清單 -->
+<div class="card border-0 shadow-sm">
+    <div class="card-header bg-white fw-bold">
+        <i class="fa-solid fa-layer-group text-primary me-2"></i>全館書目 (Book) 與實體副本 (BookCopy) 總覽
     </div>
     <div class="table-responsive">
         <table class="table table-hover align-middle mb-0">
             <thead class="table-light">
                 <tr>
-                    <th>封面</th>
-                    <th>書名 / ISBN</th>
-                    <th>作者</th>
-                    <th>館藏狀態</th>
-                    <th class="text-end">操作功能</th>
+                    <th>書目資訊 (Book)</th>
+                    <th>在館 / 總副本</th>
+                    <th>實體館藏副本與條碼 (BookCopy)</th>
+                    <th class="text-end">讀者操作</th>
                 </tr>
             </thead>
             <tbody>
                 {% for book in books %}
                 <tr>
                     <td>
-                        {% if book.cover %}
-                            <img src="{{ book.cover.url }}" alt="{{ book.title }}" class="book-cover-thumb shadow-sm">
-                        {% else %}
-                            <div class="book-cover-thumb bg-secondary bg-opacity-10 d-flex align-items-center justify-content-center text-muted">
-                                <i class="fa-solid fa-book fa-lg"></i>
-                            </div>
-                        {% endif %}
+                        <div class="fw-bold">{{ book.title }}</div>
+                        <div class="small text-muted">ISBN: {{ book.isbn }} | {{ book.author }} ({{ book.publisher }})</div>
                     </td>
                     <td>
-                        <div class="fw-bold text-dark">{{ book.title }}</div>
-                        <small class="text-muted">ISBN: {{ book.isbn }}</small>
+                        <span class="badge {% if book.available_copies_count > 0 %}bg-success{% else %}bg-danger{% endif %}">
+                            {{ book.available_copies_count }} / {{ book.total_copies_count }} 可借
+                        </span>
                     </td>
-                    <td>{{ book.author }}</td>
                     <td>
-                        {% if book.is_available %}
-                            <span class="badge bg-success-subtle text-success border border-success-subtle">
-                                <i class="fa-solid fa-check me-1"></i>在館可借
-                            </span>
-                        {% else %}
-                            <span class="badge bg-warning-subtle text-warning-emphasis border border-warning-subtle">
-                                <i class="fa-solid fa-clock me-1"></i>已借出 ({{ book.records.last.borrower_name }})
-                            </span>
-                        {% endif %}
+                        {% for copy in book.copies.all %}
+                        <div class="d-flex align-items-center gap-2 mb-1">
+                            <span class="badge bg-light text-dark border barcode-badge">{{ copy.barcode }}</span>
+                            {% if copy.status == "AVAILABLE" %}
+                                <span class="badge bg-success-subtle text-success">在館</span>
+                            {% elif copy.status == "BORROWED" %}
+                                <span class="badge bg-secondary">借出中</span>
+                            {% elif copy.status == "RESERVED" %}
+                                <span class="badge bg-warning text-dark">預約保留</span>
+                            {% else %}
+                                <span class="badge bg-danger">損壞維護</span>
+                            {% endif %}
+                            {% if is_librarian and copy.status != "DAMAGED" and copy.status != "BORROWED" %}
+                            <button hx-post="{% url 'books:report_damaged' %}"
+                                    hx-vals='{"barcode": "{{ copy.barcode }}"}'
+                                    hx-target="#workspace-container"
+                                    class="btn btn-link btn-sm text-danger p-0 text-decoration-none" title="標記損壞">
+                                <i class="fa-solid fa-triangle-exclamation"></i>
+                            </button>
+                            {% endif %}
+                        </div>
+                        {% endfor %}
                     </td>
                     <td class="text-end">
-                        <div class="d-inline-flex gap-2 align-items-center">
-                            <!-- 借閱 / 歸還控制 -->
-                            {% if book.is_available and current_role.borrow_create %}
-                                <form hx-post="{% url 'borrow_book' book.id %}" hx-target="#book-list-container" class="d-inline-flex gap-1">
-                                    <input type="text" name="borrower_name" class="form-control form-control-sm" style="width: 110px;" placeholder="借閱人" required>
-                                    <button type="submit" class="btn btn-sm btn-success" title="借出書籍">
-                                        <i class="fa-solid fa-hand-holding-hand"></i> 借出
-                                    </button>
-                                </form>
-                            {% elif not book.is_available and current_role.borrow_return %}
-                                <button hx-post="{% url 'return_book' book.id %}" hx-target="#book-list-container" class="btn btn-sm btn-info text-white">
-                                    <i class="fa-solid fa-rotate-left"></i> 歸還
-                                </button>
-                            {% endif %}
-
-                            <!-- 編輯書籍（觸發 Bootstrap Modal 編輯表單） -->
-                            {% if current_role.book_update %}
-                                <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#editModal-{{ book.id }}">
-                                    <i class="fa-solid fa-pen"></i>
-                                </button>
-                            {% endif %}
-
-                            <!-- 刪除書籍（僅具備 book.delete 權限顯示） -->
-                            {% if current_role.book_delete %}
-                                <button hx-post="{% url 'delete_book' book.id %}"
-                                        hx-target="#book-list-container"
-                                        hx-confirm="確定要永久刪除《{{ book.title }}》嗎？"
-                                        class="btn btn-sm btn-outline-danger">
-                                    <i class="fa-solid fa-trash"></i>
-                                </button>
-                            {% endif %}
-                        </div>
-
-                        <!-- 編輯書籍專用 Bootstrap Modal -->
-                        {% if current_role.book_update %}
-                        <div class="modal fade text-start" id="editModal-{{ book.id }}" tabindex="-1">
-                            <div class="modal-dialog">
-                                <div class="modal-content">
-                                    <form hx-post="{% url 'update_book' book.id %}" hx-target="#book-list-container">
-                                        <div class="modal-header">
-                                            <h5 class="modal-title"><i class="fa-solid fa-pen-to-square me-2"></i>編輯書籍資料</h5>
-                                            <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
-                                        </div>
-                                        <div class="modal-body">
-                                            <div class="mb-3">
-                                                <label class="form-label">書名</label>
-                                                <input type="text" name="title" class="form-control" value="{{ book.title }}" required>
-                                            </div>
-                                            <div class="mb-3">
-                                                <label class="form-label">作者</label>
-                                                <input type="text" name="author" class="form-control" value="{{ book.author }}" required>
-                                            </div>
-                                        </div>
-                                        <div class="modal-footer">
-                                            <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">取消</button>
-                                            <button type="submit" class="btn btn-primary" data-bs-dismiss="modal">儲存變更</button>
-                                        </div>
-                                    </form>
-                                </div>
-                            </div>
-                        </div>
+                        {% if book.available_copies_count == 0 %}
+                        <button hx-post="{% url 'books:reserve_book' book.id %}"
+                                hx-target="#workspace-container"
+                                class="btn btn-sm btn-warning">
+                            <i class="fa-solid fa-bell me-1"></i>預約候補
+                        </button>
+                        {% else %}
+                        <span class="text-muted small">請掃描條碼借閱</span>
                         {% endif %}
                     </td>
                 </tr>
                 {% empty %}
                 <tr>
-                    <td colspan="5" class="text-center py-4 text-muted">目前尚無館藏書籍資料。</td>
+                    <td colspan="4" class="text-center text-muted py-4">尚無書目資料，請由上方新增書籍。</td>
                 </tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
-</div>
-
-<!-- 重要操作稽核日誌即時看板 -->
-<div class="card shadow-sm border-0">
-    <div class="card-header bg-white fw-bold">
-        <i class="fa-solid fa-clipboard-list text-secondary me-2"></i>系統稽核日誌 (Audit Log - 最新 8 筆)
-    </div>
-    <ul class="list-group list-group-flush small">
-        {% for log in recent_logs %}
-        <li class="list-group-item d-flex justify-content-between align-items-center">
-            <div>
-                <span class="badge bg-dark me-2">{{ log.actor_role }}</span>
-                <strong class="text-primary">[{{ log.action }}]</strong>
-                <span class="ms-1">{{ log.changes }}</span>
-            </div>
-            <span class="text-muted">{{ log.timestamp|date:"Y-m-d H:i:s" }}</span>
-        </li>
-        {% empty %}
-        <li class="list-group-item text-muted text-center py-3">尚無操作紀錄</li>
-        {% endfor %}
-    </ul>
 </div>

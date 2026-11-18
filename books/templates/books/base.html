@@ -3,108 +3,103 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Enterprise Library RBAC System | 圖書館管理系統</title>
-    <!-- Google Fonts: Roboto (英數) + Noto Sans TC (繁體中文) -->
+    <title>企業級圖書館管理系統 (Book & BookCopy 架構)</title>
+    <!-- Google Fonts: Roboto & Noto Sans TC -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+TC:wght@400;500;700&family=Roboto:wght@400;500;700&display=swap" rel="stylesheet">
-    <!-- Bootstrap 5 CSS -->
+    <!-- Bootstrap 5 & Font Awesome -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <!-- Font Awesome 6 -->
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css" rel="stylesheet">
-    <!-- HTMX 2.0 -->
-    <script src="https://unpkg.com/htmx.org@2.0.0"></script>
+    <!-- HTMX -->
+    <script src="https://unpkg.com/htmx.org@1.9.12"></script>
     <style>
         body {
-            /* 優先使用 Roboto 顯示英數字，中文自動回退至 Noto Sans TC */
             font-family: 'Roboto', 'Noto Sans TC', sans-serif;
             background-color: #f4f6f9;
         }
-        .book-cover-thumb {
-            width: 54px;
-            height: 76px;
-            object-fit: cover;
-            border-radius: 4px;
+        .barcode-badge {
+            font-family: 'Roboto', monospace;
+            letter-spacing: 0.5px;
         }
     </style>
 </head>
 <body hx-headers='{"X-CSRFToken": "{{ csrf_token }}"}'>
-
-    <!-- 頂部導覽列與角色切換器 -->
-    <nav class="navbar navbar-expand-lg navbar-dark bg-dark shadow-sm mb-4">
+    <nav class="navbar navbar-expand-lg navbar-dark bg-primary shadow-sm mb-4">
         <div class="container">
-            <a class="navbar-brand fw-bold" href="{% url 'book_list' %}">
-                <i class="fa-solid fa-book-bookmark text-warning me-2"></i>智慧圖書館 RBAC 系統
+            <a class="navbar-brand fw-bold" href="{% url 'books:index' %}">
+                <i class="fa-solid fa-book-open-reader me-2"></i>智慧圖書館管理系統
             </a>
-            <div class="d-flex align-items-center gap-3">
-                <span class="badge bg-primary fs-6">
-                    <i class="fa-solid fa-user-shield me-1"></i>目前角色：{{ current_role.name }}
+            <div class="d-flex align-items-center text-white">
+                <span class="me-3">
+                    <i class="fa-solid fa-user-circle me-1"></i>{{ request.user.username }}
+                    {% if is_librarian %}<span class="badge bg-warning text-dark ms-1">館員</span>{% endif %}
                 </span>
-                <div class="dropdown">
-                    <button class="btn btn-outline-light btn-sm dropdown-toggle" type="button" data-bs-toggle="dropdown">
-                        <i class="fa-solid fa-repeat me-1"></i>切換測試角色
-                    </button>
-                    <ul class="dropdown-menu dropdown-menu-end">
-                        {% for r in all_roles %}
-                        <li>
-                            <a class="dropdown-item {% if r.code == current_role.code %}active{% endif %}"
-                               href="{% url 'switch_role' r.code %}">
-                                {{ r.name }}
-                            </a>
-                        </li>
-                        {% endfor %}
-                    </ul>
-                </div>
-                <!-- 系統設定按鈕（後端亦有 system.settings 驗證，故意保留按鈕以測試 403 攔截） -->
-                <button class="btn btn-outline-warning btn-sm"
-                        hx-get="{% url 'system_settings' %}"
-                        hx-target="#book-list-container">
-                    <i class="fa-solid fa-gear me-1"></i>系統設定
-                </button>
             </div>
         </div>
     </nav>
 
     <div class="container pb-5">
-        <!-- 角色權限矩陣即時狀態列 -->
-        <div class="alert alert-light border shadow-sm d-flex flex-wrap gap-3 align-items-center mb-4">
-            <strong class="text-secondary"><i class="fa-solid fa-key me-1"></i>當前權限矩陣：</strong>
-            <span class="badge {% if current_role.book_read %}bg-success{% else %}bg-secondary{% endif %}">book.read: {{ current_role.book_read }}</span>
-            <span class="badge {% if current_role.book_create %}bg-success{% else %}bg-secondary{% endif %}">book.create: {{ current_role.book_create }}</span>
-            <span class="badge {% if current_role.book_update %}bg-success{% else %}bg-secondary{% endif %}">book.update: {{ current_role.book_update }}</span>
-            <span class="badge {% if current_role.book_delete %}bg-success{% else %}bg-danger{% endif %}">book.delete: {{ current_role.book_delete }}</span>
-            <span class="badge {% if current_role.borrow_create %}bg-success{% else %}bg-secondary{% endif %}">borrow.create: {{ current_role.borrow_create }}</span>
-            <span class="badge {% if current_role.borrow_return %}bg-success{% else %}bg-secondary{% endif %}">borrow.return: {{ current_role.borrow_return }}</span>
-            <span class="badge {% if current_role.system_settings %}bg-success{% else %}bg-danger{% endif %}">system.settings: {{ current_role.system_settings }}</span>
+        <!-- 快速條碼作業區 (借閱 / 歸還) -->
+        <div class="row g-3 mb-4">
+            <div class="col-md-6">
+                <div class="card border-0 shadow-sm h-100">
+                    <div class="card-body">
+                        <h6 class="card-title fw-bold text-primary mb-3">
+                            <i class="fa-solid fa-barcode me-2"></i>掃描條碼借閱書籍
+                        </h6>
+                        <form hx-post="{% url 'books:borrow_copy' %}" hx-target="#workspace-container" hx-swap="innerHTML" class="d-flex gap-2">
+                            <input type="text" name="barcode" class="form-control" placeholder="輸入或掃描副本條碼 (例: LIB-1234-001-...)" required>
+                            <button type="submit" class="btn btn-primary text-nowrap">
+                                <i class="fa-solid fa-hand-holding-heart me-1"></i>借閱
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="card border-0 shadow-sm h-100">
+                    <div class="card-body">
+                        <h6 class="card-title fw-bold text-success mb-3">
+                            <i class="fa-solid fa-rotate-left me-2"></i>掃描條碼歸還書籍
+                        </h6>
+                        <form hx-post="{% url 'books:return_copy' %}" hx-target="#workspace-container" hx-swap="innerHTML" class="d-flex gap-2">
+                            <input type="text" name="barcode" class="form-control" placeholder="輸入歸還副本條碼" required>
+                            <button type="submit" class="btn btn-success text-nowrap">
+                                <i class="fa-solid fa-check-circle me-1"></i>歸還
+                            </button>
+                        </form>
+                    </div>
+                </div>
+            </div>
         </div>
 
-        <!-- 新增館藏表單（具備 book.create 權限才顯示，支援 Cloudinary 封面上傳） -->
-        {% if current_role.book_create %}
-        <div class="card shadow-sm border-0 mb-4">
+        {% if is_librarian %}
+        <!-- 館員專區：新增書目與副本入庫 -->
+        <div class="card border-0 shadow-sm mb-4">
             <div class="card-header bg-white fw-bold">
-                <i class="fa-solid fa-circle-plus text-primary me-2"></i>新增館藏書籍（支援 Cloudinary 封面）
+                <i class="fa-solid fa-plus-circle text-primary me-2"></i>館員入庫作業：新增書目與館藏副本
             </div>
             <div class="card-body">
-                <form hx-post="{% url 'add_book' %}"
-                      hx-target="#book-list-container"
-                      hx-encoding="multipart/form-data"
-                      hx-on::after-request="if(event.detail.successful) this.reset()"
-                      class="row g-3">
+                <form hx-post="{% url 'books:add_book' %}" hx-target="#workspace-container" hx-swap="innerHTML" class="row g-2">
                     <div class="col-md-3">
-                        <input type="text" name="title" class="form-control" placeholder="書名" required>
-                    </div>
-                    <div class="col-md-3">
-                        <input type="text" name="author" class="form-control" placeholder="作者" required>
+                        <input type="text" name="title" class="form-control" placeholder="書名 *" required>
                     </div>
                     <div class="col-md-2">
-                        <input type="text" name="isbn" class="form-control" placeholder="ISBN (13碼)" required>
+                        <input type="text" name="isbn" class="form-control" placeholder="ISBN *" required>
                     </div>
                     <div class="col-md-2">
-                        <input type="file" name="cover" class="form-control" accept="image/*">
+                        <input type="text" name="author" class="form-control" placeholder="作者 *" required>
                     </div>
-                    <div class="col-md-2 d-grid">
-                        <button type="submit" class="btn btn-primary">
-                            <i class="fa-solid fa-cloud-arrow-up me-1"></i>登錄書籍
+                    <div class="col-md-2">
+                        <input type="text" name="publisher" class="form-control" placeholder="出版社 *" required>
+                    </div>
+                    <div class="col-md-1">
+                        <input type="number" name="copy_count" class="form-control" value="2" min="1" max="50" title="副本數量" required>
+                    </div>
+                    <div class="col-md-2">
+                        <button type="submit" class="btn btn-dark w-100">
+                            <i class="fa-solid fa-boxes-stacked me-1"></i>建立並上架
                         </button>
                     </div>
                 </form>
@@ -112,34 +107,27 @@
         </div>
         {% endif %}
 
-        <!-- 即時搜尋列 -->
-        <div class="input-group mb-4 shadow-sm">
-            <span class="input-group-text bg-white"><i class="fa-solid fa-magnifying-glass text-muted"></i></span>
-            <input type="search" name="q" value="{{ query }}" class="form-control border-start-0"
-                   placeholder="即時搜尋書名、作者或 ISBN..."
-                   hx-get="{% url 'book_list' %}"
-                   hx-trigger="keyup changed delay:300ms, search"
-                   hx-target="#book-list-container">
-        </div>
-
-        <!-- HTMX 動態內容容器 -->
-        <div id="book-list-container">
-            {% include 'books/partials/book_list.html' %}
+        <!-- HTMX 動態工作區 (書目列表、個人借閱與預約狀態) -->
+        <div id="workspace-container">
+            {% include "books/partials/book_list.html" %}
         </div>
     </div>
 
-    <!-- 全域 Bootstrap Modal 動態掛載點 -->
-    <div id="global-modal-container"></div>
+    {% include "books/partials/modal_alert.html" %}
 
-    <!-- Bootstrap 5 JS Bundle -->
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        // 監聽 HTMX 403 Forbidden 回應，允許渲染後端回傳的錯誤提示 Modal
-        document.body.addEventListener('htmx:beforeSwap', function(evt) {
-            if (evt.detail.xhr.status === 403) {
-                evt.detail.shouldSwap = true;
-                evt.detail.isError = false;
-            }
+        // 監聽後端 HX-Trigger 事件並顯示 Bootstrap Modal 通知
+        document.body.addEventListener("showModalAlert", function(evt) {
+            const detail = evt.detail;
+            const modalEl = document.getElementById("systemAlertModal");
+            const headerEl = document.getElementById("modalAlertHeader");
+            document.getElementById("modalAlertTitle").innerText = detail.title;
+            document.getElementById("modalAlertBody").innerText = detail.message;
+
+            headerEl.className = "modal-header text-white bg-" + (detail.level || "primary");
+            const modalInstance = bootstrap.Modal.getOrCreateInstance(modalEl);
+            modalInstance.show();
         });
     </script>
 </body>

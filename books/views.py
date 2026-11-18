@@ -1,189 +1,140 @@
-from django.shortcuts import render, get_object_or_404, redirect
-from django.contrib.auth import login
-from django.contrib.auth.models import User
-from django.db.models import Q
-from django.utils import timezone
+import json
+from django.shortcuts import render, get_object_or_404
+from django.contrib.auth.decorators import login_required
 from django.views.decorators.http import require_POST
-from .models import Book, BorrowRecord, Role, AuditLog
-from .permissions import require_rbac_permission, get_user_role, log_audit
+from django.http import HttpResponse
+from .models import Book, BookCopy, LoanRecord, Reservation
+from .services import LibraryService, LibraryBusinessError
+from .permissions import librarian_required
 
 
-def _render_book_list_with_modal(request, modal_context=None):
-    """輔助函式：回傳更新後的書籍列表，並可透過 OOB (Out-Of-Band) 同時觸發 Bootstrap Modal"""
-    books = Book.objects.all().order_by('-created_at')
-    role = get_user_role(request.user)
-    recent_logs = AuditLog.objects.all()[:8]
-    context = {
-        'books': books,
-        'current_role': role,
-        'recent_logs': recent_logs,
-        'modal': modal_context,
+def _build_dashboard_context(user):
+    """組裝首頁與局部刷新所需的完整資料上下文"""
+    books = Book.objects.prefetch_related("copies").all()
+    active_loans = LoanRecord.objects.filter(user=user, status=LoanRecord.Status.ACTIVE).select_related("copy__book")
+    user_reservations = Reservation.objects.filter(
+        user=user, status__in=[Reservation.Status.WAITING, Reservation.Status.READY]
+    ).select_related("book", "assigned_copy")
+    is_librarian = user.groups.filter(name="Librarian").exists() or user.is_superuser
+
+    return {
+        "books": books,
+        "active_loans": active_loans,
+        "user_reservations": user_reservations,
+        "is_librarian": is_librarian,
     }
-    return render(request, 'books/partials/book_list.html', context)
 
 
-@require_rbac_permission('book.read')
-def book_list(request):
-    query = request.GET.get('q', '').strip()
-    books = Book.objects.all().order_by('-created_at')
-    if query:
-        books = books.filter(
-            Q(title__icontains=query) | Q(author__icontains=query) | Q(isbn__icontains=query)
-        )
-
-    role = get_user_role(request.user)
-    all_roles = Role.objects.all()
-    recent_logs = AuditLog.objects.all()[:8]
-
-    context = {
-        'books': books,
-        'query': query,
-        'current_role': role,
-        'all_roles': all_roles,
-        'recent_logs': recent_logs,
+def _htmx_response_with_modal(request, title: str, message: str, level: str = "success"):
+    """渲染最新書目列表並透過 HX-Trigger 觸發前端 Bootstrap Modal"""
+    context = _build_dashboard_context(request.user)
+    response = render(request, "books/partials/book_list.html", context)
+    trigger_payload = {
+        "showModalAlert": {
+            "title": title,
+            "message": message,
+            "level": level  # success / danger / warning
+        }
     }
-    if request.headers.get('HX-Request'):
-        return render(request, 'books/partials/book_list.html', context)
-    return render(request, 'books/base.html', context)
+    response["HX-Trigger"] = json.dumps(trigger_payload)
+    return response
 
 
-def switch_role(request, role_code):
-    """快速切換展示角色（方便體驗不同 RBAC 權限視角）"""
-    if role_code == 'guest':
-        from django.contrib.auth import logout
-        logout(request)
-    else:
-        user = get_object_or_404(User, username=f"demo_{role_code}")
-        login(request, user)
-    return redirect('book_list')
+@login_required
+def index(request):
+    context = _build_dashboard_context(request.user)
+    return render(request, "books/base.html", context)
 
 
+@login_required
+@librarian_required
 @require_POST
-@require_rbac_permission('book.create')
 def add_book(request):
-    title = request.POST.get('title', '').strip()
-    author = request.POST.get('author', '').strip()
-    isbn = request.POST.get('isbn', '').strip()
-    cover = request.FILES.get('cover')
+    """館員新增書目與館藏副本"""
+    try:
+        title = request.POST.get("title", "").strip()
+        isbn = request.POST.get("isbn", "").strip()
+        author = request.POST.get("author", "").strip()
+        publisher = request.POST.get("publisher", "").strip()
+        category = request.POST.get("category", "一般類").strip()
+        tags = request.POST.get("tags", "").strip()
+        copy_count = int(request.POST.get("copy_count", 1))
+        location = request.POST.get("location", "A區-1排").strip()
 
-    if title and author and isbn:
-        book = Book.objects.create(title=title, author=author, isbn=isbn, cover=cover)
-        log_audit(
-            request.user, 'CREATE_BOOK', 'Book', book.id,
-            f"新增書籍：《{book.title}》 (ISBN: {book.isbn})"
+        if not all([title, isbn, author, publisher]):
+            raise LibraryBusinessError("書名、ISBN、作者與出版社為必填欄位。")
+
+        book, copies = LibraryService.create_book_with_copies(
+            title=title, isbn=isbn, author=author, publisher=publisher,
+            category=category, tags=tags, copy_count=copy_count, location=location
         )
-        return _render_book_list_with_modal(request, {
-            'title': '新增館藏成功',
-            'type': 'success',
-            'icon': 'fa-circle-check',
-            'message': f'書籍《{book.title}》已成功登錄至館藏系統並寫入稽核日誌。'
-        })
-    return _render_book_list_with_modal(request)
+        barcodes = ", ".join([c.barcode for c in copies])
+        return _htmx_response_with_modal(
+            request, "上架成功", f"已建立《{book.title}》共 {len(copies)} 本副本。條碼：{barcodes}", "success"
+        )
+    except (LibraryBusinessError, ValueError) as e:
+        return _htmx_response_with_modal(request, "新增失敗", str(e), "danger")
 
 
+@login_required
 @require_POST
-@require_rbac_permission('book.update')
-def update_book(request, book_id):
-    book = get_object_or_404(Book, id=book_id)
-    old_title = book.title
-    new_title = request.POST.get('title', '').strip()
-    new_author = request.POST.get('author', '').strip()
-
-    if new_title and new_author:
-        book.title = new_title
-        book.author = new_author
-        book.save()
-        log_audit(
-            request.user, 'UPDATE_BOOK', 'Book', book.id,
-            f"修改書籍資料：原書名「{old_title}」變更為「{book.title}」，作者「{book.author}」"
+def borrow_copy(request):
+    """掃描條碼借閱書籍"""
+    barcode = request.POST.get("barcode", "").strip()
+    try:
+        loan = LibraryService.borrow_book(request.user, barcode)
+        due_str = loan.due_date.strftime("%Y-%m-%d")
+        return _htmx_response_with_modal(
+            request, "借閱成功", f"條碼 {barcode} 借閱完成！應還日期：{due_str}", "success"
         )
-        return _render_book_list_with_modal(request, {
-            'title': '書籍更新成功',
-            'type': 'primary',
-            'icon': 'fa-pen-to-square',
-            'message': f'書籍《{book.title}》資料已更新。'
-        })
-    return _render_book_list_with_modal(request)
+    except LibraryBusinessError as e:
+        return _htmx_response_with_modal(request, "借閱受阻", str(e), "danger")
 
 
+@login_required
 @require_POST
-@require_rbac_permission('book.delete')
-def delete_book(request, book_id):
-    book = get_object_or_404(Book, id=book_id)
-    title = book.title
-    book.delete()
-    log_audit(
-        request.user, 'DELETE_BOOK', 'Book', book_id,
-        f"刪除館藏書籍：《{title}》"
-    )
-    return _render_book_list_with_modal(request, {
-        'title': '書籍已刪除',
-        'type': 'warning',
-        'icon': 'fa-trash-can',
-        'message': f'館藏書籍《{title}》已從資料庫移除。'
-    })
+def return_copy(request):
+    """掃描條碼歸還書籍"""
+    barcode = request.POST.get("barcode", "").strip()
+    try:
+        result = LibraryService.return_book(barcode)
+        msg = f"條碼 {barcode} 已完成歸還。"
+        if result["is_overdue"]:
+            msg += f"【注意】已逾期，產生罰金 NT$ {result['fine']} 元。"
+        if result["notified_user"]:
+            msg += f" 本書已自動保留並通知第一順位預約者：{result['notified_user']}。"
+        level = "warning" if result["is_overdue"] else "success"
+        return _htmx_response_with_modal(request, "歸還完成", msg, level)
+    except LibraryBusinessError as e:
+        return _htmx_response_with_modal(request, "歸還失敗", str(e), "danger")
 
 
+@login_required
 @require_POST
-@require_rbac_permission('borrow.create')
-def borrow_book(request, book_id):
-    book = get_object_or_404(Book, id=book_id)
-    borrower_name = request.POST.get('borrower_name', '').strip()
-
-    if book.is_available and borrower_name:
-        book.is_available = False
-        book.save()
-        BorrowRecord.objects.create(
-            book=book,
-            borrower_name=borrower_name,
-            status='borrowed',
-            approved_by=request.user if request.user.is_authenticated else None
+def reserve_book(request, book_id):
+    """讀者預約書目"""
+    try:
+        reservation, position = LibraryService.reserve_book(request.user, book_id)
+        return _htmx_response_with_modal(
+            request, "預約成功", f"已成功登記預約《{reservation.book.title}》，目前候補順位：第 {position} 位。", "success"
         )
-        log_audit(
-            request.user, 'BORROW_BOOK', 'BorrowRecord', book.id,
-            f"借出書籍：《{book.title}》給讀者「{borrower_name}」"
-        )
-        return _render_book_list_with_modal(request, {
-            'title': '借閱登記完成',
-            'type': 'success',
-            'icon': 'fa-book-reader',
-            'message': f'已成功將《{book.title}》借出給「{borrower_name}」。'
-        })
-    return _render_book_list_with_modal(request)
+    except LibraryBusinessError as e:
+        return _htmx_response_with_modal(request, "無法預約", str(e), "danger")
 
 
+@login_required
+@librarian_required
 @require_POST
-@require_rbac_permission('borrow.return')
-def return_book(request, book_id):
-    book = get_object_or_404(Book, id=book_id)
-    if not book.is_available:
-        book.is_available = True
-        book.save()
-        record = book.records.filter(returned_at__isnull=True).last()
-        borrower = record.borrower_name if record else '未知'
-        if record:
-            record.returned_at = timezone.now()
-            record.status = 'returned'
-            record.save()
-        log_audit(
-            request.user, 'RETURN_BOOK', 'BorrowRecord', book.id,
-            f"歸還書籍：《{book.title}》（原借閱人：{borrower}）"
-        )
-        return _render_book_list_with_modal(request, {
-            'title': '書籍歸還完成',
-            'type': 'info',
-            'icon': 'fa-rotate-left',
-            'message': f'《{book.title}》已完成歸還驗收，重新開放借閱。'
-        })
-    return _render_book_list_with_modal(request)
-
-
-@require_rbac_permission('system.settings')
-def system_settings(request):
-    """系統核心設定端點（僅 Super Admin 具備 system.settings=True）"""
-    return _render_book_list_with_modal(request, {
-        'title': '系統全域設定',
-        'type': 'dark',
-        'icon': 'fa-gears',
-        'message': '歡迎進入超級管理員專屬系統設定面板。'
-    })
+def report_damaged(request):
+    """館員回報館藏損壞"""
+    barcode = request.POST.get("barcode", "").strip()
+    try:
+        res = LibraryService.mark_copy_damaged(barcode)
+        msg = f"條碼 {barcode} 已標記為損壞維護中。"
+        if res["reassigned_to"]:
+            msg += f" 原保留預約已自動轉移至備用副本：{res['reassigned_to']}。"
+        elif res["cancelled_all_waiting"]:
+            msg += " 因本書目已無可用館藏，系統已自動取消所有候補預約。"
+        return _htmx_response_with_modal(request, "館藏狀態更新", msg, "warning")
+    except LibraryBusinessError as e:
+        return _htmx_response_with_modal(request, "操作失敗", str(e), "danger")
