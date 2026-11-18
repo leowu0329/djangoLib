@@ -78,5 +78,9 @@ USE_I18N = True
 USE_TZ = True
 STATIC_URL = 'static/'
 
+LOGIN_URL = "/accounts/login/"
+LOGIN_REDIRECT_URL = "/"
+LOGOUT_REDIRECT_URL = "/accounts/login/"
+
 # 3. 讀取 Cloudinary 憑證（將預設值改為空字串 ''，確保不再出現 'demo'） CLOUDINARY_STORAGE = { 'CLOUD_NAME': os.environ.get('CLOUDINARY_CLOUD_NAME', ''), 'API_KEY': os.environ.get('CLOUDINARY_API_KEY', ''), 'API_SECRET': os.environ.get('CLOUDINARY_API_SECRET', ''), } 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
