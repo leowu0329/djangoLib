@@ -1,0 +1,28 @@
+  <div class="modal fade" id="htmxDynamicModal" tabindex="-1" aria-hidden="true">
+    <div class="modal-dialog modal-dialog-centered">
+        <div class="modal-content border-0 shadow">
+            <div class="modal-header bg-{{ modal_type }} text-white">
+                <h5 class="modal-title">
+                    <i class="fa-solid {{ modal_icon }} me-2"></i>{{ modal_title }}
+                </h5>
+                <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal" aria-label="Close"></button>
+            </div>
+            <div class="modal-body fs-6 py-4">
+                {{ modal_message }}
+            </div>
+            <div class="modal-footer">
+                <button type="button" class="btn btn-{{ modal_type }}" data-bs-dismiss="modal">確認</button>
+            </div>
+        </div>
+    </div>
+</div>
+<script>
+    // 當 HTMX 載入此片段後，自動初始化並彈出 Bootstrap Modal
+    (function() {
+        var modalEl = document.getElementById('htmxDynamicModal');
+        if (modalEl && typeof bootstrap !== 'undefined') {
+            var bsModal = new bootstrap.Modal(modalEl);
+            bsModal.show();
+        }
+    })();
+</script>  
