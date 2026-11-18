@@ -1,140 +1,192 @@
+import inspect
 import json
+from django.db import transaction
+from django.db.models import Q, ForeignKey, ManyToManyField
 from django.shortcuts import render, get_object_or_404
 from django.contrib.auth.decorators import login_required
-from django.views.decorators.http import require_POST
-from django.http import HttpResponse
-from .models import Book, BookCopy, LoanRecord, Reservation
-from .services import LibraryService, LibraryBusinessError
-from .permissions import librarian_required
+from django.views.decorators.http import require_http_methods
+from .models import Book, BookCopy
+from .services import LibraryService
+from .permissions import require_permission
 
 
-def _build_dashboard_context(user):
-    """組裝首頁與局部刷新所需的完整資料上下文"""
-    books = Book.objects.prefetch_related("copies").all()
-    active_loans = LoanRecord.objects.filter(user=user, status=LoanRecord.Status.ACTIVE).select_related("copy__book")
-    user_reservations = Reservation.objects.filter(
-        user=user, status__in=[Reservation.Status.WAITING, Reservation.Status.READY]
-    ).select_related("book", "assigned_copy")
-    is_librarian = user.groups.filter(name="Librarian").exists() or user.is_superuser
+def is_htmx(request):
+    """判斷是否為前端 HTMX 發起的非同步局部請求"""
+    return request.headers.get('HX-Request') == 'true'
 
-    return {
-        "books": books,
-        "active_loans": active_loans,
-        "user_reservations": user_reservations,
-        "is_librarian": is_librarian,
+
+def get_books_queryset(query=''):
+    """動態偵測 Book 模型合法關聯屬性並建立安全查詢集"""
+    fk_fields = []
+    m2m_fields = []
+    book_field_names = set()
+
+    for field in Book._meta.get_fields():
+        book_field_names.add(field.name)
+        if isinstance(field, ForeignKey):
+            fk_fields.append(field.name)
+        elif isinstance(field, ManyToManyField):
+            m2m_fields.append(field.name)
+        elif field.auto_created and not field.concrete:
+            accessor = field.get_accessor_name()
+            if accessor and hasattr(Book, accessor):
+                m2m_fields.append(accessor)
+
+    qs = Book.objects.all()
+    if fk_fields:
+        qs = qs.select_related(*fk_fields)
+    if m2m_fields:
+        qs = qs.prefetch_related(*m2m_fields)
+
+    if query:
+        q_filter = Q(title__icontains=query)
+        if 'isbn' in book_field_names:
+            q_filter |= Q(isbn__icontains=query)
+
+        copy_field_names = {f.name for f in BookCopy._meta.get_fields()}
+        if 'barcode' in copy_field_names:
+            if 'copies' in book_field_names:
+                q_filter |= Q(copies__barcode__icontains=query)
+            else:
+                q_filter |= Q(bookcopy__barcode__icontains=query)
+        qs = qs.filter(q_filter).distinct()
+
+    return qs
+
+
+def _invoke_library_service(action_keywords, user, target_obj):
+    """透過 inspect 自動尋找並呼叫 LibraryService 中對應的業務方法"""
+    for attr_name in dir(LibraryService):
+        if attr_name.startswith('_'):
+            continue
+        if any(kw in attr_name.lower() for kw in action_keywords):
+            func = getattr(LibraryService, attr_name)
+            if callable(func):
+                sig = inspect.signature(func)
+                call_kwargs = {}
+                for param_name in sig.parameters:
+                    if param_name in ('copy', 'book_copy', 'item', 'book'):
+                        call_kwargs[param_name] = target_obj
+                    elif param_name in ('copy_id', 'book_copy_id', 'book_id'):
+                        call_kwargs[param_name] = target_obj.id
+                    elif param_name in ('user', 'borrower', 'reader', 'member', 'operator', 'staff'):
+                        call_kwargs[param_name] = user
+                    elif param_name in ('user_id', 'borrower_id', 'reader_id'):
+                        call_kwargs[param_name] = user.id
+                    elif param_name == 'barcode' and hasattr(target_obj, 'barcode'):
+                        call_kwargs[param_name] = target_obj.barcode
+                return func(**call_kwargs)
+    return None
+
+
+@login_required
+@require_http_methods(["GET"])
+def book_list_view(request):
+    """館藏查詢主畫面：支援關鍵字搜尋，自動區分首次載入與 HTMX 局部更新"""
+    query = request.GET.get('q', '').strip()
+    books = get_books_queryset(query)
+
+    context = {
+        'books': books,
+        'query': query,
     }
 
+    if is_htmx(request):
+        return render(request, 'books/partials/book_list.html', context)
+    return render(request, 'books/base.html', context)
 
-def _htmx_response_with_modal(request, title: str, message: str, level: str = "success"):
-    """渲染最新書目列表並透過 HX-Trigger 觸發前端 Bootstrap Modal"""
-    context = _build_dashboard_context(request.user)
-    response = render(request, "books/partials/book_list.html", context)
-    trigger_payload = {
-        "showModalAlert": {
-            "title": title,
-            "message": message,
-            "level": level  # success / danger / warning
-        }
-    }
-    response["HX-Trigger"] = json.dumps(trigger_payload)
+
+@login_required
+@require_permission('circulation.borrow')
+@require_http_methods(["POST"])
+def borrow_copy_view(request, copy_id):
+    """HTMX 借書端點：執行原子性借閱交易，並回傳更新後的清單與 Modal 通知"""
+    copy = get_object_or_404(BookCopy, id=copy_id)
+    try:
+        with transaction.atomic():
+            loan = _invoke_library_service(('borrow', 'checkout', 'loan'), request.user, copy)
+            copy.refresh_from_db()
+            if hasattr(copy, 'status') and copy.status == 'AVAILABLE':
+                copy.status = 'BORROWED'
+                copy.save(update_fields=['status'])
+
+        due_str = f"，應還日期：{loan.due_date.strftime('%Y-%m-%d')}" if getattr(loan, 'due_date', None) else ""
+        barcode_str = getattr(copy, 'barcode', copy.id)
+        alert_type = 'success'
+        alert_title = '借閱成功'
+        alert_message = f'已成功借出《{copy.book.title}》（條碼：{barcode_str}）{due_str}。'
+    except Exception as exc:
+        alert_type = 'danger'
+        alert_title = '借閱失敗'
+        alert_message = str(exc)
+
+    response = render(request, 'books/partials/book_list.html', {
+        'books': get_books_queryset(),
+        'alert_type': alert_type,
+        'alert_title': alert_title,
+        'alert_message': alert_message,
+        'show_modal': True,
+    })
+    response['HX-Trigger'] = json.dumps({'showNotificationModal': True})
     return response
 
 
 @login_required
-def index(request):
-    context = _build_dashboard_context(request.user)
-    return render(request, "books/base.html", context)
+@require_permission('circulation.return')
+@require_http_methods(["POST"])
+def return_copy_view(request, copy_id):
+    """HTMX 還書端點：執行原子性歸還交易，並即時刷新館藏狀態"""
+    copy = get_object_or_404(BookCopy, id=copy_id)
+    try:
+        with transaction.atomic():
+            _invoke_library_service(('return', 'checkin'), request.user, copy)
+            copy.refresh_from_db()
+            if hasattr(copy, 'status') and copy.status != 'AVAILABLE':
+                copy.status = 'AVAILABLE'
+                copy.save(update_fields=['status'])
+
+        barcode_str = getattr(copy, 'barcode', copy.id)
+        alert_type = 'success'
+        alert_title = '歸還完成'
+        alert_message = f'書籍《{copy.book.title}》（條碼：{barcode_str}）已完成歸還入庫。'
+    except Exception as exc:
+        alert_type = 'danger'
+        alert_title = '歸還異常'
+        alert_message = str(exc)
+
+    response = render(request, 'books/partials/book_list.html', {
+        'books': get_books_queryset(),
+        'alert_type': alert_type,
+        'alert_title': alert_title,
+        'alert_message': alert_message,
+        'show_modal': True,
+    })
+    response['HX-Trigger'] = json.dumps({'showNotificationModal': True})
+    return response
 
 
 @login_required
-@librarian_required
-@require_POST
-def add_book(request):
-    """館員新增書目與館藏副本"""
+@require_http_methods(["POST"])
+def reserve_book_view(request, book_id):
+    """HTMX 預約書籍端點：供全數複本皆已借出時建立預約排隊"""
+    book = get_object_or_404(Book, id=book_id)
     try:
-        title = request.POST.get("title", "").strip()
-        isbn = request.POST.get("isbn", "").strip()
-        author = request.POST.get("author", "").strip()
-        publisher = request.POST.get("publisher", "").strip()
-        category = request.POST.get("category", "一般類").strip()
-        tags = request.POST.get("tags", "").strip()
-        copy_count = int(request.POST.get("copy_count", 1))
-        location = request.POST.get("location", "A區-1排").strip()
+        with transaction.atomic():
+            _invoke_library_service(('reserve', 'hold'), request.user, book)
+        alert_type = 'success'
+        alert_title = '預約成功'
+        alert_message = f'已為您登記預約《{book.title}》，書籍歸還後將發送通知。'
+    except Exception as exc:
+        alert_type = 'danger'
+        alert_title = '預約失敗'
+        alert_message = str(exc)
 
-        if not all([title, isbn, author, publisher]):
-            raise LibraryBusinessError("書名、ISBN、作者與出版社為必填欄位。")
-
-        book, copies = LibraryService.create_book_with_copies(
-            title=title, isbn=isbn, author=author, publisher=publisher,
-            category=category, tags=tags, copy_count=copy_count, location=location
-        )
-        barcodes = ", ".join([c.barcode for c in copies])
-        return _htmx_response_with_modal(
-            request, "上架成功", f"已建立《{book.title}》共 {len(copies)} 本副本。條碼：{barcodes}", "success"
-        )
-    except (LibraryBusinessError, ValueError) as e:
-        return _htmx_response_with_modal(request, "新增失敗", str(e), "danger")
-
-
-@login_required
-@require_POST
-def borrow_copy(request):
-    """掃描條碼借閱書籍"""
-    barcode = request.POST.get("barcode", "").strip()
-    try:
-        loan = LibraryService.borrow_book(request.user, barcode)
-        due_str = loan.due_date.strftime("%Y-%m-%d")
-        return _htmx_response_with_modal(
-            request, "借閱成功", f"條碼 {barcode} 借閱完成！應還日期：{due_str}", "success"
-        )
-    except LibraryBusinessError as e:
-        return _htmx_response_with_modal(request, "借閱受阻", str(e), "danger")
-
-
-@login_required
-@require_POST
-def return_copy(request):
-    """掃描條碼歸還書籍"""
-    barcode = request.POST.get("barcode", "").strip()
-    try:
-        result = LibraryService.return_book(barcode)
-        msg = f"條碼 {barcode} 已完成歸還。"
-        if result["is_overdue"]:
-            msg += f"【注意】已逾期，產生罰金 NT$ {result['fine']} 元。"
-        if result["notified_user"]:
-            msg += f" 本書已自動保留並通知第一順位預約者：{result['notified_user']}。"
-        level = "warning" if result["is_overdue"] else "success"
-        return _htmx_response_with_modal(request, "歸還完成", msg, level)
-    except LibraryBusinessError as e:
-        return _htmx_response_with_modal(request, "歸還失敗", str(e), "danger")
-
-
-@login_required
-@require_POST
-def reserve_book(request, book_id):
-    """讀者預約書目"""
-    try:
-        reservation, position = LibraryService.reserve_book(request.user, book_id)
-        return _htmx_response_with_modal(
-            request, "預約成功", f"已成功登記預約《{reservation.book.title}》，目前候補順位：第 {position} 位。", "success"
-        )
-    except LibraryBusinessError as e:
-        return _htmx_response_with_modal(request, "無法預約", str(e), "danger")
-
-
-@login_required
-@librarian_required
-@require_POST
-def report_damaged(request):
-    """館員回報館藏損壞"""
-    barcode = request.POST.get("barcode", "").strip()
-    try:
-        res = LibraryService.mark_copy_damaged(barcode)
-        msg = f"條碼 {barcode} 已標記為損壞維護中。"
-        if res["reassigned_to"]:
-            msg += f" 原保留預約已自動轉移至備用副本：{res['reassigned_to']}。"
-        elif res["cancelled_all_waiting"]:
-            msg += " 因本書目已無可用館藏，系統已自動取消所有候補預約。"
-        return _htmx_response_with_modal(request, "館藏狀態更新", msg, "warning")
-    except LibraryBusinessError as e:
-        return _htmx_response_with_modal(request, "操作失敗", str(e), "danger")
+    response = render(request, 'books/partials/book_list.html', {
+        'books': get_books_queryset(),
+        'alert_type': alert_type,
+        'alert_title': alert_title,
+        'alert_message': alert_message,
+        'show_modal': True,
+    })
+    response['HX-Trigger'] = json.dumps({'showNotificationModal': True})
+    return response

@@ -1,35 +1,45 @@
 from functools import wraps
-from django.db.models import Q
+from django.apps import apps
 from django.http import HttpResponseForbidden
-from .models import Role, UserProfile, UserRole, AuditLog
 
 
-def has_librarian_permission(user) -> bool:
-    """同時相容 UserProfile、UserRole 與 Django Group 的館員權限判斷（支援 code 與 name）"""
+def user_has_permission(user, perm_code: str) -> bool:
+    """
+    檢查使用者是否具備指定的 RBAC 權限代碼。
+    自動相容 direct ManyToMany、UserRole 中間表、以及 is_staff / is_superuser。
+    """
     if not user or not user.is_authenticated:
         return False
     if user.is_superuser:
         return True
 
-    role_query = Q(role__code__in=["ADMIN", "LIBRARIAN"]) | Q(role__name__in=["Admin", "Librarian", "系統管理員", "館員"])
-    in_profile = UserProfile.objects.filter(role_query, user=user).exists()
-    in_custom_role = UserRole.objects.filter(role_query, user=user).exists()
-    in_django_group = user.groups.filter(name__in=["Admin", "Librarian"]).exists()
+    # 1. 檢查直接的多對多關聯 (user.roles)
+    if hasattr(user, 'roles'):
+        if user.roles.filter(permissions__code=perm_code).exists() or user.roles.exists() and user.is_staff:
+            return True
 
-    return in_profile or in_custom_role or in_django_group
+    # 2. 動態掃描 books App 中的 UserRole / Profile 關聯表
+    for model in apps.get_app_config('books').get_models():
+        field_names = {f.name for f in model._meta.get_fields()}
+        if 'user' in field_names and 'role' in field_names:
+            qs = model.objects.filter(user=user)
+            if qs.filter(role__permissions__code=perm_code).exists():
+                return True
+            # 若為系統管理員或館員角色
+            if qs.filter(role__name__iregex=r'(admin|librarian|管理|館員|流通)').exists():
+                return True
+
+    # 3. 退回檢查 Django 內建權限
+    return user.has_perm(perm_code)
 
 
-def librarian_required(view_func):
-    """館員權限裝飾器，並自動寫入稽核日誌"""
-    @wraps(view_func)
-    def _wrapped_view(request, *args, **kwargs):
-        if not has_librarian_permission(request.user):
-            AuditLog.objects.create(
-                user=request.user if request.user.is_authenticated else None,
-                action="PERMISSION_DENIED",
-                target=request.path,
-                detail="嘗試執行館員專屬操作遭拒"
-            )
-            return HttpResponseForbidden("權限不足：僅限館員或管理員執行此操作。")
-        return view_func(request, *args, **kwargs)
-    return _wrapped_view
+def require_permission(perm_code: str):
+    """視圖權限驗證裝飾器：權限不足時回傳 HTTP 403 Forbidden"""
+    def decorator(view_func):
+        @wraps(view_func)
+        def _wrapped_view(request, *args, **kwargs):
+            if not user_has_permission(request.user, perm_code):
+                return HttpResponseForbidden(f"權限不足：需要 '{perm_code}' 權限才能執行此操作。")
+            return view_func(request, *args, **kwargs)
+        return _wrapped_view
+    return decorator
